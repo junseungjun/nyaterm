@@ -1,0 +1,89 @@
+name: Fork Windows Build
+
+# 포크 전용: main 브랜치 코드를 Windows x64 설치파일(exe) + 포터블 zip으로 빌드한다.
+# GitHub 웹 UI: Actions 탭 → "Fork Windows Build" → Run workflow
+# 결과: 이 실행의 Artifacts에서 NyaTerm-windows-x64를 내려받는다.
+#
+# 업스트림(.github/workflows/native-package.yml)의 Windows 잡과 동일한 단계만
+# 발췌했다. 테스트/서명/MSI/provenance는 생략했고, 산출물 이름 규약상
+# NYATERM_ARTIFACT_VERSION=main-snapshot을 쓰므로 MSI는 만들지 않는다
+# (setup.exe + portable.zip만 생성 — MSI는 안정 버전 릴리스 전용).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-windows-build
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  build-windows-x64:
+    name: Build Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Rust (MSVC + ATL 구성 포함)
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-pc-windows-msvc
+          cache-key: fork-windows-x64
+          cache-on-failure: 'true'
+          save-cache: always
+
+      - name: Install NSIS
+        shell: pwsh
+        run: ./scripts/ci/install-nsis.ps1
+
+      - name: Prepare bundled ConPTY
+        shell: pwsh
+        run: python scripts/release/prepare_conpty.py
+
+      - name: Package native application (Windows MSVC)
+        shell: pwsh
+        env:
+          NYATERM_ARTIFACT_VERSION: main-snapshot
+          TARGET: x86_64-pc-windows-msvc
+        run: |
+          # Git Bash의 link.exe가 MSVC 링커를 가리는 것을 방지하는 상류 점검.
+          $linker = (Get-Command link.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          if ($linker -notmatch '\\VC\\Tools\\MSVC\\[^\\]+\\bin\\HostX64\\(x64|arm64)\\link\.exe$') {
+            throw "Expected Visual Studio MSVC linker, got: $linker"
+          }
+          python scripts/release/package_native.py "$env:TARGET"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify native package
+        shell: bash
+        env:
+          TARGET: x86_64-pc-windows-msvc
+          ARTIFACT_VERSION: main-snapshot
+        run: >-
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['workspace']['package']['version'])")
+          && python scripts/release/verify_native_package.py
+          --target "${TARGET}" --version "${VERSION}"
+          --artifact-version "${ARTIFACT_VERSION}" --dist dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: NyaTerm-windows-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
